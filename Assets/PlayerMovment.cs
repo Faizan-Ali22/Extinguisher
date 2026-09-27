@@ -1,23 +1,33 @@
-using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
 
+/// <summary>
+/// Alternative joystick movement using Rigidbody velocity.
+/// Uses FixedUpdate for proper physics integration.
+/// Note: If PlayerController is handling movement, this script
+/// should be disabled to avoid conflicts.
+/// </summary>
 public class PlayerMovment : MonoBehaviour
 {
     public FixedJoystick joy;
-    private float xinput, yinput;
     public Rigidbody rb;
-    // Start is called before the first frame update
+    public float moveSpeed = 5f;
+
+    private float xinput, yinput;
+
     void Start()
     {
-      rb = GetComponent<Rigidbody>();
+        if (rb == null)
+            rb = GetComponent<Rigidbody>();
     }
 
-    // Update is called once per frame
-    void Update()
+    // Physics movement belongs in FixedUpdate, not Update
+    void FixedUpdate()
     {
+        if (joy == null || rb == null) return;
+
         xinput = joy.Horizontal;
         yinput = joy.Vertical;
-        rb.linearVelocity= new Vector3 (xinput, yinput, 0f);
+
+        rb.linearVelocity = new Vector3(xinput * moveSpeed, rb.linearVelocity.y, yinput * moveSpeed);
     }
 }
