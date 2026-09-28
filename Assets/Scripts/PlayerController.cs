@@ -3,15 +3,16 @@ using UnityEngine.UI;
 using UnityEngine.EventSystems;
 
 /// <summary>
-/// Handles player movement (joystick) and water spray (hold button).
+/// Handles player movement (joystick + WASD) and water spray (hold button + Space).
+/// Movement uses Rigidbody physics so walls and colliders properly block the player.
 /// Water detection uses SphereCast for reliable, mobile-friendly fire targeting.
-/// The water particle effect is purely visual; fire damage is applied via raycasting.
 /// </summary>
 public class PlayerController : MonoBehaviour
 {
     [Header("Movement")]
     public float movementSpeed = 5f;
     public Joystick movementJoystick;
+    public float rotationSpeed = 12f;
 
     [Header("Water Spray — References")]
     public Button shootingButton;
@@ -23,14 +24,13 @@ public class PlayerController : MonoBehaviour
     public float shootingCooldown = 0.5f;   // Kept for serialization compat
     public int maxWaterInstances = 3;       // Kept for serialization compat
 
-    [Tooltip("How far the water spray reaches")]
     public float sprayRange = 20f;
-
-    [Tooltip("Damage dealt to fire per second while spraying")]
     public float sprayDamagePerSecond = 55f;
-
-    [Tooltip("SphereCast radius — larger = more forgiving aim (good for mobile)")]
     public float sprayRadius = 2.5f;
+
+    [Header("Water Visual Adjustment")]
+    [Tooltip("Euler rotation offset for the water particle relative to the nozzle.")]
+    public Vector3 waterRotationOffset = new Vector3(-90f, 0f, 0f);
 
     [Header("References")]
     public GameObject firePrefab; // Kept for scene serialization compatibility
@@ -39,171 +39,202 @@ public class PlayerController : MonoBehaviour
     private bool isSpraying;
     private float lastStopTime;
     private ParticleSystem waterEffect;
-    private Vector3 lastMoveDir = Vector3.forward;
+    private Rigidbody rb;
+    private Vector3 moveInput;
+    private Transform hoseRoot; // Keep track of the hose to force it to follow
 
     void Start()
     {
+        rb = GetComponent<Rigidbody>();
+        if (rb == null)
+        {
+            Debug.LogError("[PlayerController] No Rigidbody on player!");
+            return;
+        }
+
+        // Configure Rigidbody for smooth ground movement
+        rb.useGravity = false;
+        rb.constraints = RigidbodyConstraints.FreezeRotation | RigidbodyConstraints.FreezePositionY;
+        rb.interpolation = RigidbodyInterpolation.Interpolate;
+
         SetupWaterEffect();
         SetupSprayButton();
     }
 
-    /// <summary>
-    /// Instantiate the water particle system once as a child of the nozzle.
-    /// Strip physics components — we use raycasting, not collider overlap.
-    /// </summary>
+    // ================================================================
+    //  WATER EFFECT SETUP
+    // ================================================================
+
     void SetupWaterEffect()
     {
-        if (waterPrefab == null || hoseNozzle == null) return;
+        // 1. Ensure the hose nozzle is forcibly attached to the player root.
+        // If it was parented to an animated mesh bone that isn't moving with the root,
+        // it gets left behind. We parent it to the main player transform to be safe.
+        if (hoseNozzle != null)
+        {
+            hoseRoot = hoseNozzle.root == hoseNozzle ? hoseNozzle : hoseNozzle.parent;
+            // Reparent to the player directly to ensure it moves with the rigid body
+            if (hoseNozzle.parent != this.transform)
+            {
+                // Try to bring the parent object (like GardenHose) if it's there
+                Transform topHoseLevel = hoseNozzle;
+                while (topHoseLevel.parent != null && topHoseLevel.parent != this.transform && topHoseLevel.parent.name.Contains("Hose"))
+                {
+                    topHoseLevel = topHoseLevel.parent;
+                }
+                topHoseLevel.SetParent(this.transform, true);
+            }
+            
+            waterEffect = hoseNozzle.GetComponent<ParticleSystem>();
+            if (waterEffect == null)
+                waterEffect = hoseNozzle.GetComponentInChildren<ParticleSystem>();
+        }
 
-        GameObject waterObj = Instantiate(waterPrefab, hoseNozzle);
-        waterObj.transform.localPosition = Vector3.zero;
-        waterObj.transform.localRotation = Quaternion.identity;
+        // 2. Fallback if no particle system was found in the scene
+        if (waterEffect == null && waterPrefab != null)
+        {
+            Transform parent = hoseNozzle != null ? hoseNozzle : transform;
+            GameObject waterObj = Instantiate(waterPrefab, parent);
+            waterObj.transform.localPosition = Vector3.zero;
+            waterObj.transform.localRotation = Quaternion.Euler(waterRotationOffset);
+            waterObj.transform.localScale = Vector3.one;
 
-        // Remove physics components (not needed — spray is visual only)
-        Rigidbody rb = waterObj.GetComponent<Rigidbody>();
-        if (rb != null) Destroy(rb);
+            Rigidbody waterRb = waterObj.GetComponent<Rigidbody>();
+            if (waterRb != null) Destroy(waterRb);
+            foreach (Collider col in waterObj.GetComponents<Collider>())
+                Destroy(col);
 
-        foreach (Collider col in waterObj.GetComponents<Collider>())
-            Destroy(col);
+            waterEffect = waterObj.GetComponent<ParticleSystem>();
+        }
 
-        waterEffect = waterObj.GetComponent<ParticleSystem>();
+        // 3. Configure the particle system to NOT trail behind
         if (waterEffect != null)
+        {
+            var main = waterEffect.main;
+            main.playOnAwake = false;
+            
+            // CRITICAL FIX: Change to Local space!
+            // This forces the water stream to stay rigidly in front of the player
+            // instead of leaving a trail of particles behind them as they move.
+            main.simulationSpace = ParticleSystemSimulationSpace.Local;
+            
             waterEffect.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            Debug.Log("[PlayerController] Water effect ready — using " + waterEffect.gameObject.name);
+        }
     }
 
-    /// <summary>
-    /// Wire the spray button for hold-to-spray using PointerDown / PointerUp events.
-    /// This gives much better feel than OnClick for a continuous spray mechanic.
-    /// </summary>
+    // ================================================================
+    //  SPRAY BUTTON SETUP
+    // ================================================================
+
     void SetupSprayButton()
     {
         if (shootingButton == null) return;
-
         EventTrigger trigger = shootingButton.GetComponent<EventTrigger>();
-        if (trigger == null)
-            trigger = shootingButton.gameObject.AddComponent<EventTrigger>();
+        if (trigger == null) trigger = shootingButton.gameObject.AddComponent<EventTrigger>();
 
-        // Pointer Down → Start spraying
-        EventTrigger.Entry down = new EventTrigger.Entry
-        {
-            eventID = EventTriggerType.PointerDown
-        };
+        EventTrigger.Entry down = new EventTrigger.Entry { eventID = EventTriggerType.PointerDown };
         down.callback.AddListener(_ => StartSpraying());
         trigger.triggers.Add(down);
 
-        // Pointer Up → Stop spraying
-        EventTrigger.Entry up = new EventTrigger.Entry
-        {
-            eventID = EventTriggerType.PointerUp
-        };
+        EventTrigger.Entry up = new EventTrigger.Entry { eventID = EventTriggerType.PointerUp };
         up.callback.AddListener(_ => StopSpraying());
         trigger.triggers.Add(up);
     }
 
     // ================================================================
-    //  UPDATE LOOP
+    //  UPDATE
     // ================================================================
 
     void Update()
     {
-        HandleMovement();
+        ReadInput();
 
-        if (isSpraying)
-        {
-            DetectAndDamageFire();
-        }
+        if (Input.GetKeyDown(KeyCode.Space)) StartSpraying();
+        if (Input.GetKeyUp(KeyCode.Space)) StopSpraying();
+
+        if (isSpraying) DetectAndDamageFire();
     }
 
     // ================================================================
-    //  MOVEMENT
+    //  LATE UPDATE - Force Follow 
     // ================================================================
-
-    void HandleMovement()
+    
+    void LateUpdate()
     {
-        if (movementJoystick == null) return;
-
-        float h = movementJoystick.Horizontal;
-        float v = movementJoystick.Vertical;
-
-        Vector3 move = new Vector3(h, 0f, v) * movementSpeed * Time.deltaTime;
-        transform.Translate(move, Space.World);
-
-        // Rotate player to face movement direction (smooth)
-        if (move.sqrMagnitude > 0.0001f)
+        // Absolute fallback: If the hose still somehow gets left behind due to 
+        // animation overrides, we forcibly snap it to the player's position.
+        if (hoseNozzle != null && hoseNozzle.parent != this.transform)
         {
-            lastMoveDir = move.normalized;
-            Quaternion target = Quaternion.LookRotation(lastMoveDir, Vector3.up);
-            transform.rotation = Quaternion.Slerp(
-                transform.rotation, target, 12f * Time.deltaTime);
+            hoseNozzle.position = transform.position + transform.forward + Vector3.up;
+            hoseNozzle.rotation = transform.rotation * Quaternion.Euler(waterRotationOffset);
         }
     }
 
-    // ================================================================
-    //  WATER SPRAY — FIRE DETECTION
-    // ================================================================
+    void ReadInput()
+    {
+        float h = 0f, v = 0f;
+        if (movementJoystick != null)
+        {
+            h = movementJoystick.Horizontal;
+            v = movementJoystick.Vertical;
+        }
+        if (Mathf.Abs(h) < 0.1f && Mathf.Abs(v) < 0.1f)
+        {
+            h = Input.GetAxisRaw("Horizontal");
+            v = Input.GetAxisRaw("Vertical");
+        }
+        moveInput = new Vector3(h, 0f, v);
+        if (moveInput.sqrMagnitude > 1f) moveInput.Normalize();
+    }
 
-    /// <summary>
-    /// Casts a thick ray (SphereCast) from the hose nozzle forward.
-    /// Any fire hit receives continuous water damage.
-    /// QueryTriggerInteraction.Collide ensures we detect trigger colliders.
-    /// </summary>
+    void FixedUpdate()
+    {
+        if (rb == null) return;
+        Vector3 targetVel = moveInput * movementSpeed;
+        rb.linearVelocity = new Vector3(targetVel.x, rb.linearVelocity.y, targetVel.z);
+
+        if (moveInput.sqrMagnitude > 0.01f)
+        {
+            Quaternion targetRot = Quaternion.LookRotation(moveInput, Vector3.up);
+            rb.rotation = Quaternion.Slerp(rb.rotation, targetRot, rotationSpeed * Time.fixedDeltaTime);
+        }
+    }
+
     void DetectAndDamageFire()
     {
-        if (hoseNozzle == null) return;
+        Vector3 origin = hoseNozzle != null ? hoseNozzle.position : transform.position;
+        Vector3 dir = transform.forward; 
 
-        Vector3 origin = hoseNozzle.position;
-        Vector3 dir = hoseNozzle.forward;
-
-        RaycastHit[] hits = Physics.SphereCastAll(
-            origin, sprayRadius, dir, sprayRange,
-            Physics.DefaultRaycastLayers,
-            QueryTriggerInteraction.Collide);
-
+        RaycastHit[] hits = Physics.SphereCastAll(origin, sprayRadius, dir, sprayRange, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Collide);
         float dmg = sprayDamagePerSecond * Time.deltaTime;
 
         foreach (RaycastHit hit in hits)
         {
             if (!hit.collider.CompareTag("Fire")) continue;
-
             FireScript fire = hit.collider.GetComponent<FireScript>();
-            if (fire != null && !fire.IsExtinguished)
-            {
-                fire.ApplyWaterDamage(dmg);
-            }
+            if (fire != null && !fire.IsExtinguished) fire.ApplyWaterDamage(dmg);
         }
-
-        // Editor debug line
-        Debug.DrawRay(origin, dir * sprayRange, Color.cyan);
     }
-
-    // ================================================================
-    //  SPRAY START / STOP
-    // ================================================================
 
     public void StartSpraying()
     {
+        if (isSpraying) return;
         isSpraying = true;
-        if (waterEffect != null)
-            waterEffect.Play(true);
+        if (waterEffect != null) waterEffect.Play(true);
     }
 
     public void StopSpraying()
     {
+        if (!isSpraying) return;
         isSpraying = false;
         lastStopTime = Time.time;
-        if (waterEffect != null)
-            waterEffect.Stop(true, ParticleSystemStopBehavior.StopEmitting);
+        if (waterEffect != null) waterEffect.Stop(true, ParticleSystemStopBehavior.StopEmitting);
     }
 
-    /// <summary>
-    /// Legacy method — the Button OnClick in the scene calls this.
-    /// Fires a short burst so the existing wiring still works.
-    /// </summary>
     public void ShootWater()
     {
-        // Skip if StopSpraying just ran (EventTrigger PointerUp fires before OnClick)
         if (Time.time - lastStopTime < 0.15f) return;
-
         if (!isSpraying)
         {
             StartSpraying();
@@ -212,9 +243,5 @@ public class PlayerController : MonoBehaviour
         }
     }
 
-    /// <summary>Legacy method kept for backward compatibility.</summary>
-    public void waterButton()
-    {
-        ShootWater();
-    }
+    public void waterButton() => ShootWater();
 }
